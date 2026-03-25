@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import List, Optional
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -26,7 +28,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+        *,
+        holov_scatter: bool = False,
+        holov_keep_ratio: float = 0.5,
+        holov_num_groups: int = 16,
+        holov_fill: str = "idw",
+        holov_layer_indices: Optional[List[int]] = None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -36,6 +48,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            holov_scatter (bool): If True, apply HoloV-style sparse selection on patch tokens and scatter
+                back to a full H/patch_size × W/patch_size grid before DPT heads (inference-oriented).
+            holov_keep_ratio (float): Target fraction of patch tokens to keep (0, 1].
+            holov_num_groups (int): Number of contiguous groups along the flattened patch sequence (HoloV-style).
+            holov_fill (str): How to fill dropped patch positions: "zero", "mean", "nearest", or "idw" /
+                "interpolate" (IDW blend from kept tokens in 2D patch coordinates).
+            holov_layer_indices (list[int], optional): Which aggregator layers to rewrite; default matches
+                DPT multi-scale indices [4, 11, 17, 23].
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -59,6 +79,24 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points = query_points.unsqueeze(0)
 
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+
+        if holov_scatter:
+            from vggt.utils.holov_scatter import apply_holov_scatter_to_aggregated_list
+
+            layers = holov_layer_indices if holov_layer_indices is not None else [4, 11, 17, 23]
+            kr = float(holov_keep_ratio)
+            kr = max(min(kr, 1.0), 1e-6)
+            if kr < 1.0:
+                aggregated_tokens_list = apply_holov_scatter_to_aggregated_list(
+                    aggregated_tokens_list,
+                    patch_start_idx,
+                    images,
+                    self.aggregator.patch_size,
+                    holov_num_groups,
+                    kr,
+                    holov_fill,
+                    layers,
+                )
 
         predictions = {}
 
