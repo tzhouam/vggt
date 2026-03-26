@@ -91,6 +91,62 @@ def parse_args():
         "Blocks 0..N run with full tokens; blocks N+1..23 run with reduced tokens. "
         "Lower = more speedup but coarser importance estimates. Default: 4",
     )
+    ######### Token merge pipeline (improved unmerge) #########
+    parser.add_argument(
+        "--token_merge",
+        action="store_true",
+        help="Use improved merge-unmerge pipeline inside global attention layers "
+        "(training-free acceleration with residual-compensated unmerge)",
+    )
+    parser.add_argument(
+        "--merge_ratio",
+        type=float,
+        default=0.75,
+        help="Fraction of non-anchor patch tokens that become src (merged). "
+        "Higher = more compression / speedup. Default: 0.75",
+    )
+    parser.add_argument(
+        "--merge_salient_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of patch tokens protected as salient anchors. Default: 0.1",
+    )
+    parser.add_argument(
+        "--merge_residual_weight",
+        type=float,
+        default=0.3,
+        help="Residual compensation weight during unmerge (0=pure copy, 1=full residual). Default: 0.3",
+    )
+    parser.add_argument(
+        "--merge_start_block",
+        type=int,
+        default=0,
+        help="First global-attention block to apply merging (0-indexed). Default: 0",
+    )
+    ######### AVGGT-style fast mode (quality-preserving) #########
+    parser.add_argument(
+        "--fast_mode",
+        action="store_true",
+        help="AVGGT-style quality-preserving acceleration: convert early global layers "
+        "to frame attention + KV subsampling in later layers. Preferred over --token_merge.",
+    )
+    parser.add_argument(
+        "--fast_early_frame_layers",
+        type=int,
+        default=8,
+        help="Number of early global layers to run as frame attention (no cross-view). Default: 8",
+    )
+    parser.add_argument(
+        "--fast_kv_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of K/V tokens to keep in global attention (later layers). Default: 0.25",
+    )
+    parser.add_argument(
+        "--fast_no_mean_fill",
+        action="store_true",
+        help="Disable mean-fill token in KV subsampling (not recommended).",
+    )
     parser.add_argument(
         "--weights",
         type=str,
@@ -494,6 +550,15 @@ def run_VGGT(
     holov_keep_ratio=0.5,
     holov_num_groups=16,
     holov_prune_layer=4,
+    token_merge=False,
+    merge_ratio=0.75,
+    merge_salient_ratio=0.1,
+    merge_residual_weight=0.3,
+    merge_start_block=0,
+    fast_mode=False,
+    fast_early_frame_layers=8,
+    fast_kv_ratio=0.25,
+    fast_mean_fill=True,
 ):
     # images: [B, 3, H, W]
     assert len(images.shape) == 4
@@ -503,8 +568,10 @@ def run_VGGT(
     timing = {}
     t_e2e_start = _cuda_sync_time()
 
+    use_token_merge = token_merge and not holov_scatter and not fast_mode
+
     prune_config = None
-    if holov_scatter:
+    if holov_scatter and not fast_mode:
         kr = max(min(float(holov_keep_ratio), 1.0), 1e-6)
         if kr < 1.0:
             prune_config = {
@@ -516,10 +583,31 @@ def run_VGGT(
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             images = images[None]  # add batch dimension
-            aggregated_tokens_list, ps_idx, agg_t = _run_aggregator_timed(
-                model.aggregator, images, prune_config=prune_config
-            )
-            timing.update(agg_t)
+
+            if fast_mode:
+                ts = _cuda_sync_time()
+                aggregated_tokens_list, ps_idx = model.aggregator.forward_fast(
+                    images,
+                    early_frame_layers=fast_early_frame_layers,
+                    kv_ratio=fast_kv_ratio,
+                    use_mean_fill=fast_mean_fill,
+                )
+                timing["aggregator_fast"] = _cuda_sync_time() - ts
+            elif use_token_merge:
+                ts = _cuda_sync_time()
+                aggregated_tokens_list, ps_idx = model.aggregator.forward_merged(
+                    images,
+                    merge_ratio=merge_ratio,
+                    salient_ratio=merge_salient_ratio,
+                    residual_weight=merge_residual_weight,
+                    merge_start_block=merge_start_block,
+                )
+                timing["aggregator_merged"] = _cuda_sync_time() - ts
+            else:
+                aggregated_tokens_list, ps_idx, agg_t = _run_aggregator_timed(
+                    model.aggregator, images, prune_config=prune_config
+                )
+                timing.update(agg_t)
 
         # --- Camera head ---
         ts = _cuda_sync_time()
@@ -712,8 +800,24 @@ def demo_fn(args):
             holov_keep_ratio=args.holov_keep_ratio,
             holov_num_groups=args.holov_num_groups,
             holov_prune_layer=args.holov_prune_layer,
+            token_merge=args.token_merge,
+            merge_ratio=args.merge_ratio,
+            merge_salient_ratio=args.merge_salient_ratio,
+            merge_residual_weight=args.merge_residual_weight,
+            merge_start_block=args.merge_start_block,
+            fast_mode=args.fast_mode,
+            fast_early_frame_layers=args.fast_early_frame_layers,
+            fast_kv_ratio=args.fast_kv_ratio,
+            fast_mean_fill=not args.fast_no_mean_fill,
         )
-        _print_timing("run_VGGT" + (" [HoloV]" if args.holov_scatter else ""), timing)
+        label = "run_VGGT"
+        if args.fast_mode:
+            label += " [FastMode]"
+        elif args.holov_scatter:
+            label += " [HoloV]"
+        elif args.token_merge:
+            label += " [TokenMerge]"
+        _print_timing(label, timing)
         points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
 
     if args.visualize:

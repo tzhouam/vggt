@@ -38,6 +38,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         holov_num_groups: int = 16,
         holov_fill: str = "idw",
         holov_layer_indices: Optional[List[int]] = None,
+        # --- token merge pipeline (improved unmerge) ---
+        token_merge: bool = False,
+        merge_ratio: float = 0.75,
+        merge_salient_ratio: float = 0.1,
+        merge_residual_weight: float = 0.3,
+        merge_start_block: int = 0,
+        # --- AVGGT-style fast mode (quality-preserving) ---
+        fast_mode: bool = False,
+        fast_early_frame_layers: int = 8,
+        fast_kv_ratio: float = 0.25,
+        fast_mean_fill: bool = True,
     ):
         """
         Forward pass of the VGGT model.
@@ -56,6 +67,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 "interpolate" (IDW blend from kept tokens in 2D patch coordinates).
             holov_layer_indices (list[int], optional): Which aggregator layers to rewrite; default matches
                 DPT multi-scale indices [4, 11, 17, 23].
+            token_merge (bool): If True, use the improved merge-unmerge pipeline inside global
+                attention layers for training-free acceleration.
+            merge_ratio (float): Fraction of non-anchor patch tokens to merge (0, 1].
+            merge_salient_ratio (float): Fraction of patch tokens protected as salient anchors.
+            merge_residual_weight (float): Weight for residual compensation during unmerge.
+            merge_start_block (int): First global-attention block index to apply merging.
+            fast_mode (bool): If True, use AVGGT-style quality-preserving acceleration:
+                early global layers → frame attention, later layers → KV subsampling.
+            fast_early_frame_layers (int): Number of early global layers to run as frame attention.
+            fast_kv_ratio (float): Fraction of K/V tokens to keep in subsampled layers.
+            fast_mean_fill (bool): Append a mean token to subsampled K/V for global context.
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -78,7 +100,23 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        if fast_mode and not self.training:
+            aggregated_tokens_list, patch_start_idx = self.aggregator.forward_fast(
+                images,
+                early_frame_layers=fast_early_frame_layers,
+                kv_ratio=fast_kv_ratio,
+                use_mean_fill=fast_mean_fill,
+            )
+        elif token_merge and not self.training:
+            aggregated_tokens_list, patch_start_idx = self.aggregator.forward_merged(
+                images,
+                merge_ratio=merge_ratio,
+                salient_ratio=merge_salient_ratio,
+                residual_weight=merge_residual_weight,
+                merge_start_block=merge_start_block,
+            )
+        else:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
         if holov_scatter:
             from vggt.utils.holov_scatter import apply_holov_scatter_to_aggregated_list
