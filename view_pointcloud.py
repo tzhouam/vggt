@@ -201,12 +201,23 @@ def main():
     verts, colors = load_points(ply_path, args.max_points)
     print(f"Points: {len(verts):,}")
 
-    title = os.path.basename(os.path.dirname(ply_path) if ply_path.endswith(".ply") else args.path)
-    if title == "sparse":
-        title = os.path.basename(os.path.dirname(os.path.dirname(ply_path)))
+    ply_basename = os.path.splitext(os.path.basename(ply_path))[0]
+    parent_dir = os.path.basename(os.path.dirname(ply_path))
+    if parent_dir in ("sparse", "sparse_fast"):
+        scene_name = os.path.basename(os.path.dirname(os.path.dirname(ply_path)))
+    else:
+        scene_name = parent_dir
+    title = f"{scene_name} — {ply_basename}" if ply_basename != "points" else scene_name
 
     out_dir = args.path if os.path.isdir(args.path) else os.path.dirname(args.path)
-    out_path = args.output or os.path.join(out_dir, "pointcloud_viewer.html")
+    if args.output:
+        out_path = args.output
+    else:
+        ply_stem = os.path.splitext(os.path.basename(ply_path))[0]
+        if ply_stem == "points":
+            out_path = os.path.join(out_dir, "pointcloud_viewer.html")
+        else:
+            out_path = os.path.join(out_dir, f"pointcloud_viewer_{ply_stem}.html")
 
     html = generate_html(verts, colors, title)
     with open(out_path, "w") as f:

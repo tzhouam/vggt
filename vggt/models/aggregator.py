@@ -502,7 +502,7 @@ class Aggregator(nn.Module):
     def forward_fast(
         self,
         images: torch.Tensor,
-        early_frame_layers: int = 8,
+        early_frame_layers: int = 4,
         kv_ratio: float = 0.25,
         use_mean_fill: bool = True,
     ) -> Tuple[List[torch.Tensor], int]:
@@ -514,9 +514,8 @@ class Aggregator(nn.Module):
         2) Subsample K/V in remaining global blocks while keeping all Q tokens,
            so every output position retains its own updated representation.
 
-        Speedup: ~2× at 100 frames, ~4-5× at 300, ~8-10× at 800 frames.
-        Quality: matches or slightly improves the original (no information loss
-        at output positions, unlike merge-unmerge which replaces src outputs).
+        IMPORTANT: early_frame_layers must be <= 4 to avoid degrading DPT head
+        features (DPT reads from layers [4, 11, 17, 23]).  Default: 4.
         """
         B, S, C_in, H, W = images.shape
         if C_in != 3:

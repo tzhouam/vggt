@@ -63,7 +63,10 @@ def parse_args():
         "--fine_tracking", action="store_true", default=True, help="Use fine tracking (slower but more accurate)"
     )
     parser.add_argument(
-        "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
+        "--conf_thres_value", type=float, default=-1,
+        help="Confidence threshold for depth filtering (wo BA). "
+        "depth_conf uses expp1 activation (values >= 1.0, typically max ~3). "
+        "Default: -1 (auto — pick the top-N most confident points where N = max_points_for_colmap)"
     )
     ######### HoloV scatter (experimental, no retraining) #########
     parser.add_argument(
@@ -169,8 +172,8 @@ def parse_args():
     parser.add_argument(
         "--eval",
         action="store_true",
-        help="When --holov_scatter is set, also run the unpruned baseline and print quality metrics "
-        "(depth, pose, Chamfer) comparing baseline vs pruned",
+        help="Run the unpruned baseline alongside the accelerated method and print quality metrics "
+        "(depth, pose, Chamfer). Works with --holov_scatter, --token_merge, or --fast_mode.",
     )
     parser.add_argument(
         "--dup_factors",
@@ -178,7 +181,7 @@ def parse_args():
         default=None,
         help="Comma-separated list of duplication factors for scaling benchmark. "
         "E.g. '1,2,4,8' with 25 images → runs at 25, 50, 100, 200 frames. "
-        "Requires --eval --holov_scatter. Prints a summary table at the end.",
+        "Requires --eval. Prints a summary table at the end.",
     )
     ######### 3DGS export #########
     parser.add_argument(
@@ -321,54 +324,56 @@ def _print_timing(label: str, timing: dict) -> None:
     print(bar + "\n")
 
 
-def _timing_speedup(t_bl: dict, t_holov: dict) -> dict:
+def _timing_speedup(t_bl: dict, t_accel: dict) -> dict:
     result = {}
     for k in t_bl:
         bl_v = t_bl.get(k, 0)
-        hv_v = t_holov.get(k, 0)
-        if bl_v > 0 and hv_v > 0:
-            result[k] = f"{bl_v / hv_v:.2f}x"
+        ac_v = t_accel.get(k, 0)
+        if bl_v > 0 and ac_v > 0:
+            result[k] = f"{bl_v / ac_v:.2f}x"
         elif bl_v > 0:
-            result[k] = "inf (0 in HoloV)"
+            result[k] = "inf (0 in accel)"
         else:
             result[k] = "n/a"
-    for k in t_holov:
+    for k in t_accel:
         if k not in result:
             result[k] = "n/a (not in baseline)"
     return result
 
 
-def _print_timing_comparison(t_bl: dict, t_holov: dict) -> None:
+def _print_timing_comparison(t_bl: dict, t_accel: dict, label: str = "Accel") -> None:
     bar = "=" * 72
     print(f"\n{bar}")
-    print("  Timing Comparison: Baseline vs HoloV")
+    print(f"  Timing Comparison: Baseline vs {label}")
     print(bar)
-    print(f"  {'Stage':28s}  {'Baseline':>10s}  {'HoloV':>10s}  {'Speedup':>10s}")
+    col = label[:10]
+    print(f"  {'Stage':28s}  {'Baseline':>10s}  {col:>10s}  {'Speedup':>10s}")
     print(f"  {'─' * 28}  {'─' * 10}  {'─' * 10}  {'─' * 10}")
-    all_keys = list(dict.fromkeys(list(t_bl.keys()) + list(t_holov.keys())))
+    all_keys = list(dict.fromkeys(list(t_bl.keys()) + list(t_accel.keys())))
     for k in all_keys:
         bl_v = t_bl.get(k, 0)
-        hv_v = t_holov.get(k, 0)
-        sp = f"{bl_v / hv_v:.2f}x" if bl_v > 0 and hv_v > 0 else "—"
-        print(f"  {k:28s}  {bl_v:9.4f}s  {hv_v:9.4f}s  {sp:>10s}")
+        ac_v = t_accel.get(k, 0)
+        sp = f"{bl_v / ac_v:.2f}x" if bl_v > 0 and ac_v > 0 else "—"
+        print(f"  {k:28s}  {bl_v:9.4f}s  {ac_v:9.4f}s  {sp:>10s}")
     print(bar + "\n")
 
 
-def _print_dup_summary(rows):
+def _print_dup_summary(rows, label: str = "Accel"):
     """
     rows: list of dicts with keys:
-      dup, n_frames, bl_e2e, hv_e2e, speedup,
-      bl_frame, hv_frame, bl_global, hv_global,
+      dup, n_frames, bl_e2e, ac_e2e, speedup,
+      bl_frame, ac_frame, bl_global, ac_global,
       sp_frame, sp_global
     """
+    col = label[:6]
     bar = "=" * 100
     print(f"\n{bar}")
-    print("  Scaling Benchmark Summary — Baseline vs HoloV at different frame counts")
+    print(f"  Scaling Benchmark Summary — Baseline vs {label} at different frame counts")
     print(bar)
     hdr = (f"  {'dup':>4s} {'frames':>6s}  "
-           f"{'BL e2e':>9s} {'HV e2e':>9s} {'e2e↑':>7s}  "
-           f"{'BL frame':>9s} {'HV frame':>9s} {'frm↑':>7s}  "
-           f"{'BL global':>9s} {'HV global':>9s} {'glb↑':>7s}")
+           f"{'BL e2e':>9s} {col + ' e2e':>9s} {'e2e↑':>7s}  "
+           f"{'BL frame':>9s} {col + ' frm':>9s} {'frm↑':>7s}  "
+           f"{'BL global':>9s} {col + ' glb':>9s} {'glb↑':>7s}")
     print(hdr)
     print(f"  {'─' * 4} {'─' * 6}  "
           f"{'─' * 9} {'─' * 9} {'─' * 7}  "
@@ -376,9 +381,9 @@ def _print_dup_summary(rows):
           f"{'─' * 9} {'─' * 9} {'─' * 7}")
     for r in rows:
         print(f"  {r['dup']:>4s} {r['n_frames']:>6d}  "
-              f"{r['bl_e2e']:>8.3f}s {r['hv_e2e']:>8.3f}s {r['speedup']:>6.2f}x  "
-              f"{r['bl_frame']:>8.3f}s {r['hv_frame']:>8.3f}s {r['sp_frame']:>6.2f}x  "
-              f"{r['bl_global']:>8.3f}s {r['hv_global']:>8.3f}s {r['sp_global']:>6.2f}x")
+              f"{r['bl_e2e']:>8.3f}s {r['ac_e2e']:>8.3f}s {r['speedup']:>6.2f}x  "
+              f"{r['bl_frame']:>8.3f}s {r['ac_frame']:>8.3f}s {r['sp_frame']:>6.2f}x  "
+              f"{r['bl_global']:>8.3f}s {r['ac_global']:>8.3f}s {r['sp_global']:>6.2f}x")
     print(bar + "\n")
 
 
@@ -541,6 +546,94 @@ def _run_aggregator_timed(aggregator, images, prune_config=None):
     return output_list, aggregator.patch_start_idx, t
 
 
+def _run_aggregator_fast_timed(aggregator, images,
+                               early_frame_layers=4, kv_ratio=0.25, use_mean_fill=True):
+    """Run Aggregator.forward_fast with per-stage timing breakdown."""
+    from vggt.models.aggregator import slice_expand_and_flatten
+    from vggt.utils.token_merge import select_kv_indices, run_block_kv_subsample
+
+    B, S, C_in, H, W = images.shape
+    t = {}
+    psi = aggregator.patch_start_idx
+    patch_h = H // aggregator.patch_size
+    patch_w = W // aggregator.patch_size
+
+    # --- 1. DINO / patch embed ---
+    t0 = _cuda_sync_time()
+    norm_images = (images - aggregator._resnet_mean) / aggregator._resnet_std
+    flat_images = norm_images.view(B * S, C_in, H, W)
+    patch_tokens = aggregator.patch_embed(flat_images)
+    if isinstance(patch_tokens, dict):
+        patch_tokens = patch_tokens["x_norm_patchtokens"]
+    t["dino_patch_embed"] = _cuda_sync_time() - t0
+
+    camera_token = slice_expand_and_flatten(aggregator.camera_token, B, S)
+    register_token = slice_expand_and_flatten(aggregator.register_token, B, S)
+    tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+
+    pos = None
+    if aggregator.rope is not None:
+        pos = aggregator.position_getter(B * S, patch_h, patch_w, device=images.device)
+    if psi > 0 and pos is not None:
+        pos = pos + 1
+        pos_special = torch.zeros(B * S, psi, 2, device=images.device, dtype=pos.dtype)
+        pos = torch.cat([pos_special, pos], dim=1)
+
+    _, P, C = tokens.shape
+
+    frame_idx = 0
+    global_idx = 0
+    output_list = []
+    t["frame_attn"] = 0.0
+    t["global_attn"] = 0.0
+    kv_idx_cache = None
+
+    for _ in range(aggregator.aa_block_num):
+        for attn_type in aggregator.aa_order:
+            if attn_type == "frame":
+                ts = _cuda_sync_time()
+                tokens, frame_idx, frame_inter = aggregator._process_frame_attention(
+                    tokens, B, S, P, C, frame_idx, pos=pos
+                )
+                t["frame_attn"] += _cuda_sync_time() - ts
+
+            elif attn_type == "global":
+                ts = _cuda_sync_time()
+
+                if global_idx < early_frame_layers:
+                    # Early layers: run as frame attention
+                    if tokens.shape != (B * S, P, C):
+                        tokens = tokens.view(B, S, P, C).view(B * S, P, C)
+                    if pos is not None and pos.shape != (B * S, P, 2):
+                        pos = pos.view(B, S, P, 2).view(B * S, P, 2)
+                    tokens = aggregator.global_blocks[global_idx](tokens, pos=pos)
+                    global_inter = [tokens.view(B, S, P, C)]
+                else:
+                    # Later layers: KV subsampling
+                    if tokens.shape != (B, S * P, C):
+                        tokens = tokens.view(B, S, P, C).view(B, S * P, C)
+                    if pos is not None and pos.shape != (B, S * P, 2):
+                        pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+                    if kv_idx_cache is None:
+                        kv_idx_cache = select_kv_indices(
+                            S, P, psi, tokens.device,
+                            kv_ratio=kv_ratio, protect_first_frame=True,
+                        )
+                    tokens = run_block_kv_subsample(
+                        aggregator.global_blocks[global_idx],
+                        tokens, pos, kv_idx_cache, use_mean_fill=use_mean_fill,
+                    )
+                    global_inter = [tokens.view(B, S, P, C)]
+
+                global_idx += 1
+                t["global_attn"] += _cuda_sync_time() - ts
+
+        for i in range(len(frame_inter)):
+            output_list.append(torch.cat([frame_inter[i], global_inter[i]], dim=-1))
+
+    return output_list, aggregator.patch_start_idx, t
+
+
 def run_VGGT(
     model,
     images,
@@ -556,7 +649,7 @@ def run_VGGT(
     merge_residual_weight=0.3,
     merge_start_block=0,
     fast_mode=False,
-    fast_early_frame_layers=8,
+    fast_early_frame_layers=4,
     fast_kv_ratio=0.25,
     fast_mean_fill=True,
 ):
@@ -585,14 +678,13 @@ def run_VGGT(
             images = images[None]  # add batch dimension
 
             if fast_mode:
-                ts = _cuda_sync_time()
-                aggregated_tokens_list, ps_idx = model.aggregator.forward_fast(
-                    images,
+                aggregated_tokens_list, ps_idx, agg_t = _run_aggregator_fast_timed(
+                    model.aggregator, images,
                     early_frame_layers=fast_early_frame_layers,
                     kv_ratio=fast_kv_ratio,
                     use_mean_fill=fast_mean_fill,
                 )
-                timing["aggregator_fast"] = _cuda_sync_time() - ts
+                timing.update(agg_t)
             elif use_token_merge:
                 ts = _cuda_sync_time()
                 aggregated_tokens_list, ps_idx = model.aggregator.forward_merged(
@@ -675,16 +767,42 @@ def demo_fn(args):
 
     # ---- Parse dup_factors ----
     dup_factors = None
+    has_accel = args.holov_scatter or args.token_merge or args.fast_mode
+
     if getattr(args, "dup_factors", None):
         dup_factors = [int(x.strip()) for x in args.dup_factors.split(",") if x.strip()]
-        if not args.eval or not args.holov_scatter:
-            print("Warning: --dup_factors requires --eval --holov_scatter. Ignoring.")
+        if not args.eval or not has_accel:
+            print("Warning: --dup_factors requires --eval plus an acceleration flag. Ignoring.")
             dup_factors = None
 
-    # ---- When --eval: run baseline FIRST, then HoloV, both after warmup ----
-    if args.eval and args.holov_scatter:
+    def _build_accel_kwargs(args):
+        """Build the keyword dict that enables whichever acceleration the user chose."""
+        kw = {}
+        if args.fast_mode:
+            kw["fast_mode"] = True
+            kw["fast_early_frame_layers"] = args.fast_early_frame_layers
+            kw["fast_kv_ratio"] = args.fast_kv_ratio
+            kw["fast_mean_fill"] = not args.fast_no_mean_fill
+        elif args.token_merge:
+            kw["token_merge"] = True
+            kw["merge_ratio"] = args.merge_ratio
+            kw["merge_salient_ratio"] = args.merge_salient_ratio
+            kw["merge_residual_weight"] = args.merge_residual_weight
+            kw["merge_start_block"] = args.merge_start_block
+        elif args.holov_scatter:
+            kw["holov_scatter"] = True
+            kw["holov_keep_ratio"] = args.holov_keep_ratio
+            kw["holov_num_groups"] = args.holov_num_groups
+            kw["holov_prune_layer"] = args.holov_prune_layer
+        return kw
+
+    accel_label = "[FastMode]" if args.fast_mode else "[TokenMerge]" if args.token_merge else "[HoloV]" if args.holov_scatter else ""
+
+    # ---- When --eval: run baseline FIRST, then accelerated, both after warmup ----
+    if args.eval and has_accel:
         from vggt.utils.eval_holov import full_comparison_report, save_report, print_report
 
+        accel_kw = _build_accel_kwargs(args)
         factors = dup_factors if dup_factors else [1]
         bench_rows = []
 
@@ -715,66 +833,57 @@ def demo_fn(args):
             )
             _print_timing(f"run_VGGT [baseline {dup_tag}]", timing_bl)
 
-            # 2) timed HoloV
-            print(f"Running HoloV-pruned ({n_frames} frames) …")
-            ext_hv, int_hv, dep_hv, conf_hv, timing_hv = run_VGGT(
-                model,
-                imgs_run,
-                dtype,
-                vggt_fixed_resolution,
-                holov_scatter=True,
-                holov_keep_ratio=args.holov_keep_ratio,
-                holov_num_groups=args.holov_num_groups,
-                holov_prune_layer=args.holov_prune_layer,
+            # 2) timed accelerated method
+            print(f"Running {accel_label} ({n_frames} frames) …")
+            ext_ac, int_ac, dep_ac, conf_ac, timing_ac = run_VGGT(
+                model, imgs_run, dtype, vggt_fixed_resolution,
+                **accel_kw,
             )
-            _print_timing(f"run_VGGT [HoloV {dup_tag}]", timing_hv)
-            _print_timing_comparison(timing_bl, timing_hv)
+            _print_timing(f"run_VGGT {accel_label} {dup_tag}", timing_ac)
+            _print_timing_comparison(timing_bl, timing_ac, label=accel_label)
 
             _safe = lambda d, k: d.get(k, 1e-9)
             bench_rows.append({
                 "dup": dup_tag,
                 "n_frames": n_frames,
                 "bl_e2e": _safe(timing_bl, "end_to_end"),
-                "hv_e2e": _safe(timing_hv, "end_to_end"),
-                "speedup": _safe(timing_bl, "end_to_end") / max(_safe(timing_hv, "end_to_end"), 1e-9),
+                "ac_e2e": _safe(timing_ac, "end_to_end"),
+                "speedup": _safe(timing_bl, "end_to_end") / max(_safe(timing_ac, "end_to_end"), 1e-9),
                 "bl_frame": _safe(timing_bl, "frame_attn"),
-                "hv_frame": _safe(timing_hv, "frame_attn"),
-                "sp_frame": _safe(timing_bl, "frame_attn") / max(_safe(timing_hv, "frame_attn"), 1e-9),
+                "ac_frame": _safe(timing_ac, "frame_attn"),
+                "sp_frame": _safe(timing_bl, "frame_attn") / max(_safe(timing_ac, "frame_attn"), 1e-9),
                 "bl_global": _safe(timing_bl, "global_attn"),
-                "hv_global": _safe(timing_hv, "global_attn"),
-                "sp_global": _safe(timing_bl, "global_attn") / max(_safe(timing_hv, "global_attn"), 1e-9),
+                "ac_global": _safe(timing_ac, "global_attn"),
+                "sp_global": _safe(timing_bl, "global_attn") / max(_safe(timing_ac, "global_attn"), 1e-9),
             })
 
         # Use the last (or only) run for downstream outputs
-        extrinsic, intrinsic, depth_map, depth_conf, timing = ext_hv, int_hv, dep_hv, conf_hv, timing_hv
+        extrinsic, intrinsic, depth_map, depth_conf, timing = ext_ac, int_ac, dep_ac, conf_ac, timing_ac
 
         if len(bench_rows) > 1:
-            _print_dup_summary(bench_rows)
+            _print_dup_summary(bench_rows, label=accel_label)
 
         # Quality report on 1x images (no dup)
         if 1 in (factors or [1]):
             ext_bl_1x, int_bl_1x, dep_bl_1x, conf_bl_1x, _ = run_VGGT(
                 model, images, dtype, vggt_fixed_resolution
             )
-            ext_hv_1x, int_hv_1x, dep_hv_1x, conf_hv_1x, timing_1x = run_VGGT(
+            ext_ac_1x, int_ac_1x, dep_ac_1x, conf_ac_1x, timing_1x = run_VGGT(
                 model, images, dtype, vggt_fixed_resolution,
-                holov_scatter=True,
-                holov_keep_ratio=args.holov_keep_ratio,
-                holov_num_groups=args.holov_num_groups,
-                holov_prune_layer=args.holov_prune_layer,
+                **accel_kw,
             )
-            points_3d = unproject_depth_map_to_point_map(dep_hv_1x, ext_hv_1x, int_hv_1x)
+            points_3d = unproject_depth_map_to_point_map(dep_ac_1x, ext_ac_1x, int_ac_1x)
             pts_bl = unproject_depth_map_to_point_map(dep_bl_1x, ext_bl_1x, int_bl_1x)
             report = full_comparison_report(
-                ext_bl_1x, ext_hv_1x,
-                dep_bl_1x, dep_hv_1x,
-                conf_bl_1x, conf_hv_1x,
+                ext_bl_1x, ext_ac_1x,
+                dep_bl_1x, dep_ac_1x,
+                conf_bl_1x, conf_ac_1x,
                 pts_bl, points_3d,
                 conf_thresh=args.conf_thres_value,
             )
-            report["timing_holov"] = {k: f"{v:.4f}s" for k, v in timing_1x.items()}
+            report[f"timing_{accel_label}"] = {k: f"{v:.4f}s" for k, v in timing_1x.items()}
             print_report(report)
-            extrinsic, intrinsic, depth_map, depth_conf = ext_hv_1x, int_hv_1x, dep_hv_1x, conf_hv_1x
+            extrinsic, intrinsic, depth_map, depth_conf = ext_ac_1x, int_ac_1x, dep_ac_1x, conf_ac_1x
             points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
         else:
             points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
@@ -838,7 +947,9 @@ def demo_fn(args):
             images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
         )
         rgb_for_gs = (rgb_for_gs.detach().cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
-        gs_path = os.path.join(args.scene_dir, "sparse", "gaussians.ply")
+        gs_dir = f"sparse_fast" if args.fast_mode else "sparse"
+        gs_suffix = f"_fast_{args.fast_early_frame_layers}_{args.fast_kv_ratio}" if args.fast_mode else ""
+        gs_path = os.path.join(args.scene_dir, gs_dir, f"gaussians{gs_suffix}.ply")
         export_3dgs_ply(
             pts_for_gs,
             rgb_for_gs,
@@ -918,9 +1029,21 @@ def demo_fn(args):
         # (S, H, W, 3), with x, y coordinates and frame indices
         points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
 
-        conf_mask = depth_conf >= conf_thres_value
-        # at most writing 100000 3d points to colmap reconstruction object
-        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+        if conf_thres_value > 0:
+            conf_mask = depth_conf >= conf_thres_value
+            conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+        else:
+            # Auto: keep the top-N most confident pixels
+            flat_conf = depth_conf.ravel()
+            n_keep = min(max_points_for_colmap, flat_conf.size)
+            # Partial sort to find the n_keep-th largest value
+            kth = flat_conf.size - n_keep
+            auto_thres = np.partition(flat_conf, kth)[kth]
+            conf_mask = depth_conf >= auto_thres
+            conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+            print(f"  Auto conf threshold: {auto_thres:.4f} "
+                  f"(top {n_keep:,} of {flat_conf.size:,} pixels, "
+                  f"conf range [{flat_conf.min():.2f}, {flat_conf.max():.2f}])")
 
         points_3d = points_3d[conf_mask]
         points_xyf = points_xyf[conf_mask]
@@ -949,13 +1072,22 @@ def demo_fn(args):
         shared_camera=shared_camera,
     )
 
-    print(f"Saving reconstruction to {args.scene_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse")
+    if args.fast_mode:
+        suffix = f"fast_{args.fast_early_frame_layers}_{args.fast_kv_ratio}"
+        sparse_dir_name = f"sparse_fast"
+        ply_name = f"points_{suffix}.ply"
+    else:
+        sparse_dir_name = "sparse"
+        ply_name = "points.ply"
+
+    sparse_reconstruction_dir = os.path.join(args.scene_dir, sparse_dir_name)
+    print(f"Saving reconstruction to {sparse_reconstruction_dir}")
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
     reconstruction.write(sparse_reconstruction_dir)
 
-    # Save point cloud for fast visualization
-    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, "sparse/points.ply"))
+    ply_path = os.path.join(sparse_reconstruction_dir, ply_name)
+    trimesh.PointCloud(points_3d, colors=points_rgb).export(ply_path)
+    print(f"Point cloud saved to {ply_path}")
 
     return True
 

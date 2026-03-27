@@ -245,7 +245,7 @@ def save_report(report: dict, path: str) -> None:
 def print_report(report: dict) -> None:
     bar = "=" * 68
     print(f"\n{bar}")
-    print("  VGGT Baseline vs HoloV-Pruned — Quality Report")
+    print("  VGGT Baseline vs Accelerated — Quality Report")
     print(f"  (Camera: RRA/RTA/AUC per VGGT Sec 4.1)")
     print(f"  (Geometry: Accuracy/Completeness/Overall per DTU/ETH3D)")
     print(bar)

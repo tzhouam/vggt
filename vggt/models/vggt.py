@@ -46,7 +46,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         merge_start_block: int = 0,
         # --- AVGGT-style fast mode (quality-preserving) ---
         fast_mode: bool = False,
-        fast_early_frame_layers: int = 8,
+        fast_early_frame_layers: int = 4,
         fast_kv_ratio: float = 0.25,
         fast_mean_fill: bool = True,
     ):
